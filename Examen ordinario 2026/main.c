@@ -3,1275 +3,1237 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-#include <limits.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "esp_timer.h"
+#include "esp_attr.h"
 
 #include "driver/i2c_master.h"
+
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_continuous.h"
-#include "soc/soc_caps.h"
 
-/* =========================================================
-   CONFIGURACION I2C E INA219
-   ========================================================= */
 
-/*
-En esta parte se establecen los valores que se van a utilizar para
-la comunicación entre el ESP32 y el sensor INA219. Se seleccionan
-los pines GPIO 21 y 22 para las conexiones SDA y SCL, respectivamente,
-que permiten el intercambio de información entre los dos dispositivos.
-También se define una velocidad de comunicación de 100 kHz y la
-dirección 0x40, que es la que utiliza el sensor para ser identificado.
+/* 2. DEFINICIONES
+   Este bloque establece los valores constantes que utiliza el programa durante la configuracion de los perifericos
+   y la ejecucion del experimento. Primero, los tres defines de pines identifican las conexiones del potenciometro y
+   las lineas SDA y SCL utilizadas por la comunicacion I2C.Despues, las definiciones del ADC establecen la unidad,
+   el canal, la resolucion de 12 bits y la atenuacion que se aplicara durante las conversiones analogicas.
+   Posteriormente, FRECUENCIA_ADC determina la frecuencia de adquisicion continua, mientras que TAMANO_BUFFER_ADC y
+   TAMANO_POOL_ADC establecen los espacios de almacenamiento utilizados por el controlador DMA.
+   Los siguientes defines establecen los tiempos de estabilizacion, duracion de las pruebas e intervalos para
+   actualizar las mediciones y presentar los reportes. Finalmente, las constantes del INA219 identifican sus
+   registros, direccion I2C, configuracion y calibracion.CURRENT_LSB y POWER_LSB permiten convertir los registros
+   de corriente y potencia a sus respectivas unidades. VOLTAJE_REFERENCIA y VALOR_ADC_MAXIMO se utilizan para
+   obtener una estimacion del voltaje del potenciometro. */
 
-Por último, se guardan las direcciones de los registros internos del
-INA219. Estos registros permiten enviarle configuraciones al sensor
-y consultar los valores que obtiene durante las mediciones de voltaje
-y corriente.
-*/
+// Pines del circuito
+#define PIN_POTENCIOMETRO       34
+#define PIN_SDA                 21
+#define PIN_SCL                 22
 
-#define I2C_SDA_GPIO        21
-#define I2C_SCL_GPIO        22
-#define I2C_FREQUENCY       100000
+// Configuracion ADC
+#define CANAL_ADC               ADC_CHANNEL_6
+#define UNIDAD_ADC              ADC_UNIT_1
+#define RESOLUCION_ADC          ADC_BITWIDTH_12
+#define ATENUACION_ADC          ADC_ATTEN_DB_12
 
-#define INA219_ADDRESS      0x40
-#define INA219_REG_CONFIG   0x00
-#define INA219_REG_BUSV     0x02
-#define INA219_REG_CURRENT  0x04
-#define INA219_REG_CALIB    0x05
+// Configuracion ADC Continuous
+#define FRECUENCIA_ADC          20000
+#define TAMANO_BUFFER_ADC       256
+#define TAMANO_POOL_ADC         1024
 
-/* =========================================================
-   CONFIGURACION ADC
-   ========================================================= */
+// Tiempos del experimento
+#define TIEMPO_ESTABILIZACION   10
+#define TIEMPO_PRUEBA           120
+#define INTERVALO_INA           1000000
+#define INTERVALO_REPORTE       5000000
 
-/*
-Aquí se definen los parámetros que se utilizarán para obtener las
-lecturas del potenciómetro conectado al GPIO34 del ESP32. Este pin
-corresponde al canal ADC1_CH6, por lo que se selecciona ese canal
-para convertir el voltaje de entrada en valores digitales.
+// Configuracion INA219
+#define DIRECCION_INA219        0x40
 
-También se establecen los valores que se utilizarán durante la prueba
-con DMA. Se configura una frecuencia de 20,000 muestras por segundo,
-pero se utiliza una decimación de 2, es decir, se conserva una muestra
-por cada dos que se reciben. Con esto se obtiene una frecuencia efectiva
-esperada de 10,000 muestras por segundo.
+#define REG_CONFIG              0x00
+#define REG_BUS_VOLTAGE         0x02
+#define REG_POWER               0x03
+#define REG_CURRENT             0x04
+#define REG_CALIBRATION         0x05
 
-Finalmente, se define el espacio destinado a almacenar los datos
-recibidos y el tamaño de los bloques que se van a procesar durante
-la adquisición.
-*/
+#define VALOR_CONFIG_INA219     0x399F
+#define VALOR_CALIBRACION       4096
 
-#define ADC_CHANNEL         ADC_CHANNEL_6
-#define ADC_ATTEN           ADC_ATTEN_DB_12
+#define CURRENT_LSB             0.0001
+#define POWER_LSB               0.002
 
-#define FRECUENCIA_DMA      20000
-#define DECIMACION          2
-#define FRECUENCIA_EFECTIVA (FRECUENCIA_DMA / DECIMACION)
+// Conversion aproximada del ADC
+#define VOLTAJE_REFERENCIA      3.3
+#define VALOR_ADC_MAXIMO        4095
 
-#define BUFFER_DMA          4096
-#define TAMANO_BLOQUE       256
 
-// En el método One-shot se realizan 10 lecturas individuales por cada bloque.
-#define MUESTRAS_POR_BLOQUE 10
+/* 3. VARIABLES GLOBALES
+   Este bloque declara las variables que necesitan utilizar diferentes funciones del programa para compartir datos.
+   Primero, Bus_I2C y Dispositivo_INA219 almacenan los manejadores del bus de comunicacion y del sensor INA219.
+   Despues, ADC_OneShot y ADC_DMA almacenan los manejadores correspondientes a los dos metodos de adquisicion ADC.
+   Las variables Voltaje_Alimentacion, Corriente_Alimentacion y Potencia_Alimentacion guardan las mediciones electricas
+   obtenidas mediante las lecturas del INA219. Posteriormente, Energia_J acumula la energia calculada,
+   mientras que Potencia_Anterior y Tiempo_Energia_Anterior conservan los datos de la medicion previa para integrar
+   la potencia respecto al tiempo. Suma_ADC_Reporte y Muestras_ADC_Reporte permiten acumular
+   las conversiones del potenciometro y calcular su promedio. Finalmente, Desbordamientos_DMA registra los eventos en
+   los que se produce un desbordamiento del buffer DMA. */
 
-/* =========================================================
-   CONFIGURACION DE LA PRUEBA
-   ========================================================= */
-
-/*
-Se establecen los tiempos que se utilizarán para realizar las pruebas.
-Cada método tendrá una duración de 120 segundos, lo que permite
-obtener una cantidad considerable de muestras y mediciones eléctricas.
-
-Antes de comenzar cada prueba se deja un periodo de estabilización
-de 10 segundos, durante el cual se realizan lecturas del INA219 para
-observar el comportamiento inicial del sistema antes de comenzar
-a registrar los resultados correspondientes a la evaluación.
-*/
-
-#define DURACION_PRUEBA     120000000LL
-#define ESTABILIZACION_S    10
-
-/* =========================================================
-   VARIABLES GLOBALES
-   ========================================================= */
-
-/*
-En esta sección se declaran las variables que se necesitan en
-diferentes partes del programa. Los identificadores de I2C permiten
-mantener la comunicación con el INA219, mientras que la variable
-ADC_OneShot guarda la referencia de la unidad ADC utilizada para
-realizar las conversiones individuales.
-
-También se tienen variables para conservar las últimas lecturas
-de voltaje, corriente y potencia obtenidas del sensor. Por otra parte,
-se utiliza Desbordamientos_DMA como contador de las ocasiones en
-que el almacenamiento de datos del DMA llega a su límite.
-
-Estas variables se mantienen disponibles para que las distintas
-funciones puedan consultar o actualizar sus valores durante las pruebas.
-*/
-
+// Manejadores de los perifericos
 static i2c_master_bus_handle_t Bus_I2C;
-static i2c_master_dev_handle_t INA219;
+static i2c_master_dev_handle_t Dispositivo_INA219;
 
 static adc_oneshot_unit_handle_t ADC_OneShot;
+static adc_continuous_handle_t ADC_DMA;
 
-static float Voltaje_Lectura = 0;
-static float Corriente_Lectura = 0;
-static float Potencia_Lectura = 0;
+// Variables de medicion del INA219
+static float Voltaje_Alimentacion = 0;
+static float Corriente_Alimentacion = 0;
+static float Potencia_Alimentacion = 0;
 
+// Variables para la energia
+static double Energia_J = 0;
+static float Potencia_Anterior = 0;
+static int64_t Tiempo_Energia_Anterior = 0;
+
+// Variables para el promedio del potenciometro
+static uint64_t Suma_ADC_Reporte = 0;
+static uint32_t Muestras_ADC_Reporte = 0;
+
+// Contador de desbordamientos DMA
 static volatile uint32_t Desbordamientos_DMA = 0;
 
-/* =========================================================
-   ESTRUCTURA DE RESULTADOS
-   ========================================================= */
 
-/*
-Se crea la estructura Resultados_t para mantener organizados los
-datos que se obtienen durante cada prueba. En lugar de declarar
-muchas variables independientes, se agrupan en una sola estructura
-las mediciones eléctricas, los valores obtenidos del ADC y la
-información relacionada con el tiempo de ejecución.
+/* 4. ESTRUCTURAS
+   Este bloque define la estructura Resultados_ADC, que permite reunir en un solo conjunto los datos obtenidos
+   durante cada una de las pruebas de adquisicion. Primero, Muestras_Totales almacena el numero de muestras
+   registradas, mientras que Desbordamientos, Lecturas_INA y Bloques_Procesados contabilizan eventos del experimento.
+   Despues, Voltaje_Promedio, Corriente_Promedio y Potencia_Promedio guardan los promedios electricos.
+   Las variables Suma_Voltaje, Suma_Corriente y Suma_Potencia acumulan las lecturas utilizadas para obtener esos valores.
+   Posteriormente, Energia_Total y Duracion_Efectiva almacenan la energia calculada y el tiempo real de cada prueba.
+   Tiempo_Procesamiento conserva el tiempo empleado en las operaciones de adquisicion y procesamiento de muestras.
+   Finalmente, se declaran tres estructuras independientes: Resultado_OneShot guarda los resultados del primer metodo,
+   Resultado_DMA conserva los del segundo metodo y Resultado_Actual almacena temporalmente los resultados
+   correspondientes a la prueba que se esta ejecutando. */
 
-Dentro de ella se guardan las sumas y los promedios de voltaje,
-corriente y potencia, además de la energía acumulada durante la
-prueba. También se registran la cantidad de muestras obtenidas,
-su promedio, los valores mínimo y máximo del ADC y el tiempo
-utilizado para procesar las lecturas.
+// Estructura para guardar los resultados de cada prueba
+typedef struct
+{
+    uint64_t Muestras_Totales;
 
-Otros campos permiten conocer la duración de la prueba, la frecuencia
-real de adquisición, la cantidad de lecturas realizadas al INA219,
-los bloques procesados y los posibles desbordamientos del DMA.
-De esta manera, al terminar cada método se cuenta con la información
-necesaria para mostrar sus resultados y realizar una comparación.
-
-Se declaran dos variables de esta estructura porque se necesita
-guardar por separado la información de cada método: una corresponde
-a la prueba sin DMA y la otra a la prueba con DMA.
-*/
-
-typedef struct {
-    double Energia_J;
-
-    double Voltaje_Suma;
-    double Corriente_Suma;
-    double Potencia_Suma;
+    uint32_t Desbordamientos;
+    uint32_t Lecturas_INA;
+    uint32_t Bloques_Procesados;
 
     double Voltaje_Promedio;
     double Corriente_Promedio;
     double Potencia_Promedio;
 
-    uint64_t Suma_ADC;
-    double Promedio_ADC;
+    double Suma_Voltaje;
+    double Suma_Corriente;
+    double Suma_Potencia;
 
-    double Tiempo_Procesamiento_ADC_us;
-    double Tiempo_Procesamiento_Promedio_us;
+    double Energia_Total;
+    double Duracion_Efectiva;
 
-    double Duracion_s;
-    double Frecuencia_Real_Hz;
+    int64_t Tiempo_Procesamiento;
 
-    uint32_t Lecturas_INA;
-    uint32_t Muestras_ADC;
-    uint32_t Muestras_ADC_Raw;
-    uint32_t Muestras_Perdidas;
-    uint32_t Bloques;
-    uint32_t Desbordamientos;
+} Resultados_ADC;
 
-    uint32_t ADC_Minimo;
-    uint32_t ADC_Maximo;
 
-} Resultados_t;
+// Resultados independientes de cada metodo
+static Resultados_ADC Resultado_OneShot;
+static Resultados_ADC Resultado_DMA;
+static Resultados_ADC Resultado_Actual;
 
-static Resultados_t Resultados_Sin_DMA;
-static Resultados_t Resultados_Con_DMA;
 
-/* =========================================================
-   PROTOTIPOS
-   ========================================================= */
+/* 5. PROTOTIPOS DE FUNCIONES
+   Este bloque declara las funciones que se implementan posteriormente en el archivo y que son utilizadas por
+   la funcion principal y por otros procedimientos. Primero, se declaran las funciones de inicializacion,
+   encargadas de configurar I2C, INA219 y los controladores ADC. Despues, se indican las funciones de comunicacion con el
+   INA219, que permiten escribir registros, leer registros individuales y obtener las variables electricas.
+   Posteriormente, se declaran las funciones de control del experimento, encargadas de realizar las estabilizaciones
+   y preparar el ADC Continuous antes de iniciar la prueba. Tambien se declaran las funciones de adquisicion One-shot
+   y DMA, junto con los procedimientos de procesamiento, registro de muestras, calculo de resultados y reportes.
+   Finalmente, se declara ADC_Overflow_Callback(), que recibe los datos del evento de desbordamiento del controlador
+   ADC Continuous y permite contabilizar dicho evento. */
 
-/*
-Antes de desarrollar las funciones se declaran sus prototipos.
-Esto permite indicar desde el inicio cuáles serán las funciones
-que se utilizarán en el programa, qué información recibirán y
-cuáles devolverán un resultado.
+// Inicializacion
+void I2C_Init(void);
+void INA219_Init(void);
+void ADC_OneShot_Init(void);
+void ADC_DMA_Init(void);
 
-Se incluyen las funciones relacionadas con la comunicación I2C,
-las lecturas del INA219, la preparación del ADC y el desarrollo
-de las dos pruebas. También se declaran las funciones que permiten
-actualizar los datos obtenidos, calcular los promedios, mostrar
-reportes durante la ejecución y presentar la comparación final.
+// Funciones del INA219
+void INA219_Escribir(uint8_t Registro, uint16_t Dato);
+uint16_t INA219_Leer_Registro(uint8_t Registro);
+void INA219_Leer(void);
 
-De esta forma, el código queda organizado en diferentes partes
-y cada función se encarga de una actividad específica.
-*/
+// Control del experimento
+void Estabilizacion(void);
+void Preparar_DMA(void);
+void Mostrar_Estado_Estabilizacion(int Tiempo);
 
-static void I2C_Init(void);
-static void INA219_Init(void);
+// Adquisicion
+void Prueba_Sin_DMA(void);
+void Prueba_Con_DMA(void);
 
-static void ADC_Init(void);
-static void ADC_Deinit(void);
+// Procesamiento
+void Registrar_Muestra(int Valor_ADC);
+void Actualizar_Alimentacion(void);
+void Calcular_Resultados(void);
 
-static void Estabilizar_Sistema(void);
+// Reportes
+void Mostrar_Reporte(int Tiempo);
+void Mostrar_Comparacion(void);
 
-static uint16_t INA219_Leer_Registro(uint8_t Registro);
-static void INA219_Leer(void);
-
-static void Actualizar_Energia(
-    Resultados_t *Resultados,
-    int64_t *Marca_Energia_us,
-    double *Potencia_Anterior
-);
-
-static void Finalizar_Resultados(
-    Resultados_t *Resultados,
-    int64_t Inicio_Prueba,
-    int64_t Fin_Prueba
-);
-
-static void Mostrar_Reporte(
-    const char *Modo,
-    Resultados_t *Resultados,
-    int64_t Transcurrido_us
-);
-
-static bool ADC_Desborde_Callback(
+// Callback de desbordamiento DMA
+static bool ADC_Overflow_Callback(
     adc_continuous_handle_t Handle,
     const adc_continuous_evt_data_t *Datos,
     void *Usuario
 );
 
-static Resultados_t Prueba_Sin_DMA(void);
-static Resultados_t Prueba_Con_DMA(void);
 
-static void Mostrar_Comparacion(void);
-static void Ejecutar_Evaluacion_Completa(void);
-
-/* =========================================================
-   FUNCION PRINCIPAL
-   ========================================================= */
-
-/*
-La función app_main es el punto donde comienza la ejecución del
-programa. Primero se prepara la comunicación I2C y se configura
-el INA219, ya que este sensor se utilizará durante las dos pruebas
-para medir el consumo eléctrico del sistema.
-
-Después se ejecuta la evaluación completa mediante la función
-Ejecutar_Evaluacion_Completa. Cuando termina, el programa permanece
-en un ciclo de espera con pausas de dos segundos. Esto evita que
-la evaluación vuelva a comenzar automáticamente y permite que
-los resultados permanezcan visibles en la terminal.
-*/
+/* 6. FUNCION PRINCIPAL
+   Este bloque contiene app_main(), que organiza la ejecucion general del experimento mediante una maquina de estados.
+   Primero, se llaman I2C_Init(), INA219_Init() y ADC_OneShot_Init() para configurar los perifericos que
+   se necesitan al comienzo del programa. Despues, se declara la variable Estado y se inicializa
+   en cero para indicar que el experimento comienza en su primera etapa de ejecucion. El ciclo while(1) mantiene el programa funcionando
+   permanentemente, mientras que switch(Estado) selecciona la funcion que corresponde ejecutar en cada etapa.
+   En el estado 0 se realiza la estabilizacion inicial y se avanza al estado 1 para ejecutar la prueba One-shot.
+   El estado 2 prepara el ADC Continuous y realiza su estabilizacion antes de avanzar al estado 3.
+   En el estado 3 se ejecuta la prueba DMA y posteriormente se detiene y libera el controlador ADC Continuous.
+   El estado 4 llama a Mostrar_Comparacion() para presentar los resultados de ambos metodos de adquisicion.
+   Finalmente, el estado 5 mantiene el programa en espera mediante vTaskDelay(), evitando repetir el experimento. */
 
 void app_main(void)
 {
+    // Inicializacion de los perifericos
     I2C_Init();
     INA219_Init();
+    ADC_OneShot_Init();
 
-    while (1) {
-        Ejecutar_Evaluacion_Completa();
+    // Variable para controlar las etapas del experimento
+    int Estado = 0;
 
-        // Se mantiene el programa en espera después de mostrar los resultados.
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
+    while (1)
+    {
+        switch (Estado)
+        {
+            case 0:
+
+                // Estabilizacion inicial
+                Estabilizacion();
+                Estado = 1;
+                break;
+
+            case 1:
+
+                // Prueba ADC One-shot
+                Prueba_Sin_DMA();
+                Estado = 2;
+                break;
+
+            case 2:
+
+                // Preparacion y estabilizacion para DMA
+                Preparar_DMA();
+                Estado = 3;
+                break;
+
+            case 3:
+
+                // Prueba ADC Continuous con DMA
+                Prueba_Con_DMA();
+
+                // Detencion y liberacion del ADC Continuous
+                adc_continuous_stop(ADC_DMA);
+                adc_continuous_deinit(ADC_DMA);
+                Estado = 4;
+              break;
+
+            case 4:
+
+                // Comparacion final de los resultados
+                Mostrar_Comparacion();
+                Estado = 5;
+                break;
+
+            case 5:
+
+                // El experimento ha terminado
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
         }
     }
 }
 
-/* =========================================================
-   LOGICA PRINCIPAL DE LA EVALUACION
-   ========================================================= */
 
-/*
-Esta función organiza el orden en que se realizan las pruebas para
-poder comparar los dos métodos de adquisición. Primero se ejecuta
-la prueba sin DMA, en la que el ESP32 solicita las conversiones
-del ADC de manera individual mediante One-shot. Los resultados
-obtenidos se guardan en Resultados_Sin_DMA.
+/* 7. FUNCIONES COMPLETAS
+   Este apartado contiene la implementacion de las funciones declaradas anteriormente y constituye el funcionamiento
+   especifico de cada periferico y etapa del experimento. Primero se encuentran los procedimientos relacionados
+   con la comunicacion I2C y la configuracion del INA219. Despues se implementan las funciones de configuracion
+   y adquisicion de los dos metodos de conversion del ADC. Posteriormente se desarrollan las funciones encargadas
+   de estabilizar el sistema, registrar muestras, actualizar las mediciones electricas y generar reportes periodicos.
+   Finalmente, se incluyen las funciones que calculan los resultados obtenidos y presentan la comparacion final
+   entre ADC One-shot y ADC Continuous con DMA. */
 
-Después se agrega una pausa de tres segundos para separar ambos
-procesos y posteriormente se ejecuta la prueba con DMA, donde las
-conversiones se reciben de forma continua y se procesan por bloques.
-Sus resultados se guardan en Resultados_Con_DMA.
 
-Una vez terminadas las dos pruebas, se llama a Mostrar_Comparacion
-para presentar los valores obtenidos y observar las diferencias
-entre ambos métodos.
-*/
+/* 
+   7.1 INICIALIZACION I2C
+   Este bloque se encarga de configurar la comunicacion I2C que utiliza el ESP32 para intercambiar informacion con
+   el sensor INA219. Primero se declara la estructura Configuracion_I2C, donde se establece el puerto I2C_NUM_0,
+   los pines SDA y SCL, la fuente de reloj, el contador para ignorar interferencias y la habilitacion de pull-up.
+   Despues, mediante i2c_new_master_bus(), se crea el bus y se guarda su manejador en la variable Bus_I2C.
+   Posteriormente se declara Configuracion_INA219, donde se establece la direccion del sensor y la velocidad de
+   comunicacion de 100 kHz. Finalmente, i2c_master_bus_add_device() incorpora el INA219 al bus y almacena su manejador en Dispositivo_INA219
+   para utilizarlo en las siguientes funciones.
+    */
 
-static void Ejecutar_Evaluacion_Completa(void)
+void I2C_Init(void)
 {
-    /* Primera etapa: realizar la prueba sin DMA. */
-    Resultados_Sin_DMA = Prueba_Sin_DMA();
-
-    /* Pausa para separar los dos métodos de adquisición. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    /* Segunda etapa: realizar la prueba con DMA. */
-    Resultados_Con_DMA = Prueba_Con_DMA();
-
-    /* Mostrar los resultados de ambas pruebas. */
-    Mostrar_Comparacion();
-}
-
-/* =========================================================
-   INICIALIZAR I2C
-   ========================================================= */
-
-/*
-En esta función se prepara la comunicación que permite al ESP32
-intercambiar información con el INA219. Primero se crea una
-configuración donde se indican los pines que se utilizarán para
-SDA y SCL, el puerto I2C y la velocidad de comunicación.
-
-Después se agrega el INA219 al bus utilizando su dirección 0x40.
-Con esto se obtiene un identificador que posteriormente se utiliza
-para enviar datos al sensor y solicitar las mediciones que se
-necesitan durante las pruebas.
-*/
-
-static void I2C_Init(void)
-{
+    // Configuracion del bus I2C
     i2c_master_bus_config_t Configuracion_I2C = {
         .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_GPIO,
-        .scl_io_num = I2C_SCL_GPIO,
+        .sda_io_num = PIN_SDA,
+        .scl_io_num = PIN_SCL,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .flags.enable_internal_pullup = true
     };
 
-    i2c_new_master_bus(&Configuracion_I2C, &Bus_I2C);
+    i2c_new_master_bus(
+        &Configuracion_I2C,
+        &Bus_I2C
+    );
 
+    // Configuracion del dispositivo INA219
     i2c_device_config_t Configuracion_INA219 = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = INA219_ADDRESS,
-        .scl_speed_hz = I2C_FREQUENCY,
+        .device_address = DIRECCION_INA219,
+        .scl_speed_hz = 100000
     };
 
     i2c_master_bus_add_device(
         Bus_I2C,
         &Configuracion_INA219,
-        &INA219
+        &Dispositivo_INA219
     );
 }
 
-/* =========================================================
-   INICIALIZAR INA219
-   ========================================================= */
 
-/*
-En esta función se preparan los valores que se enviarán a los
-registros internos del INA219 para dejarlo listo para realizar
-las mediciones eléctricas. Se utilizan dos arreglos: el primero
-contiene la información de calibración y el segundo los valores
-de configuración general del sensor.
+/* 
+   7.2 INICIALIZACION INA219
+   Este bloque configura el sensor INA219 para comenzar amedir las variables electricas de la alimentacion.
+   Primero, printf() muestra un mensaje que identifica el inicio de la configuracion del sensor en el monitor serial.
+   Despues, INA219_Escribir() recibe REG_CONFIG y VALOR_CONFIG_INA219 para establecer el modo de medicion
+   y los parametros de funcionamiento del dispositivo. Posteriormente, otra llamada a INA219_Escribir() utiliza
+   REG_CALIBRATION y VALOR_CALIBRACION para establecer la calibracion correspondiente a la resistencia shunt de
+   0.1 ohm utilizada en el sistema. Finalmente, printf() muestra el mensaje de confirmacion de configuracion del INA219.
+    */
 
-La calibración permite que el INA219 pueda obtener correctamente
-la medición de corriente de acuerdo con la resistencia de medición
-utilizada. Posteriormente, ambos arreglos se envían mediante I2C
-al sensor. Al terminar se agrega una pausa de dos segundos para
-dar tiempo a que quede preparado antes de continuar con el programa.
-*/
-
-static void INA219_Init(void)
+void INA219_Init(void)
 {
-    uint8_t Calibracion[3] = {
-        INA219_REG_CALIB, 0x10, 0x00
-    };
+    printf("\nInicializando INA219...\n");
 
-    uint8_t Configuracion[3] = {
-        INA219_REG_CONFIG, 0x39, 0x9F
-    };
-
-    i2c_master_transmit(
-        INA219,
-        Calibracion,
-        sizeof(Calibracion),
-        1000
+    // Configuracion de medicion del sensor
+    INA219_Escribir(
+        REG_CONFIG,
+        VALOR_CONFIG_INA219
     );
 
-    i2c_master_transmit(
-        INA219,
-        Configuracion,
-        sizeof(Configuracion),
-        1000
+    INA219_Escribir(
+        REG_CALIBRATION,
+        VALOR_CALIBRACION
     );
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    printf("INA219 configurado.\n");
 }
 
-/* =========================================================
-   INICIALIZAR ADC ONE-SHOT
-   ========================================================= */
 
-/*
-Esta función prepara el convertidor analógico-digital del ESP32
-para trabajar en modo One-shot. Primero se establece que se utilizará
-la unidad ADC1 y se guarda su identificador en ADC_OneShot para
-poder realizar las lecturas posteriormente.
+/* 
+   7.3 ESCRITURA DE REGISTROS INA219
+   Este bloque permite enviar informacion a un registro especifico del sensor INA219 mediante comunicacion I2C.
+   Primero, la funcion recibe Registro y Dato como parametros, donde Registro identifica la posicion que se modificara
+   y Dato contiene el valor de 16 bits que sera transmitido. Despues, se declara el arreglo Datos con tres posiciones
+   para almacenar la direccion del registro y sus dos bytes. La instruccion Datos[0] guarda el numero del registro,
+   mientras que Datos[1] obtiene el byte mas significativo mediante un desplazamiento de ocho bits y una mascara.
+   Posteriormente, Datos[2] conserva el byte menos significativo aplicando una mascara para seleccionar los ocho bits.
+   Finalmente, i2c_master_transmit() envia los tres elementos al dispositivo identificado por Dispositivo_INA219.
+    */
 
-Después se configura el canal que está conectado al potenciómetro,
-indicando la resolución predeterminada y la atenuación seleccionada.
-En este método, cada conversión se solicita directamente desde
-el programa, por lo que el ESP32 realiza una lectura cuando se
-ejecuta la función correspondiente.
-*/
-
-static void ADC_Init(void)
+void INA219_Escribir(uint8_t Registro, uint16_t Dato)
 {
-    adc_oneshot_unit_init_cfg_t Configuracion_Unidad = {
-        .unit_id = ADC_UNIT_1,
+    // Se envia el registro y posteriormente los dos bytes
+    uint8_t Datos[3];
+
+    Datos[0] = Registro;
+    Datos[1] = (Dato >> 8) & 0xFF;
+    Datos[2] = Dato & 0xFF;
+
+    i2c_master_transmit(
+        Dispositivo_INA219,
+        Datos,
+        sizeof(Datos),
+        100
+    );
+}
+
+
+/* 
+   7.4 LECTURA DE REGISTROS INA219
+   Este bloque permite obtener el contenido de un registro de 16 bits del sensor INA219 mediante comunicacion I2C.
+   Primero, la funcion recibe Registro, que indica cual es el registro que se desea consultar en el dispositivo.
+   Despues, se declara el arreglo Lectura con dos posiciones inicializadas en cero para recibir los bytes transmitidos.
+   Posteriormente, i2c_master_transmit_receive() envia la direccion del registro y solicita la recepcion de dos
+   bytes, que quedan almacenados en Lectura. Finalmente, la instruccion return desplaza Lectura[0]
+   ocho posiciones hacia la izquierda y combina ese resultado con Lectura[1] mediante el operador OR, reconstruyendo
+   el valor completo de 16 bits que devuelve la funcion.
+    */
+
+uint16_t INA219_Leer_Registro(uint8_t Registro)
+{
+    // Lectura de los dos bytes del registro seleccionado
+    uint8_t Lectura[2] = {0, 0};
+
+    i2c_master_transmit_receive(
+        Dispositivo_INA219,
+        &Registro,
+        1,
+        Lectura,
+        2,
+        100
+    );
+
+    return ((uint16_t)Lectura[0] << 8) | Lectura[1];
+}
+
+
+/* 
+   7.5 LECTURA DE VOLTAJE, CORRIENTE Y POTENCIA
+   Este bloque obtiene las tres variables electricas medidas por el INA219 y las convierte a unidades fisicas.
+   Primero se declaran Dato_Voltaje, Dato_Corriente y Dato_Potencia, que almacenaran los valores digitales
+   recibidos desde los registros internos del sensor. Despues, se llama tres veces a INA219_Leer_Registro(),
+   utilizando REG_BUS_VOLTAGE, REG_CURRENT y REG_POWER para obtener los datos de voltaje, corriente y potencia.
+   Posteriormente, Dato_Voltaje se desplaza tres bits a la derecha y se multiplica por 0.004 para obtener el voltaje.
+   Dato_Corriente se interpreta como un entero con signo y se multiplica por CURRENT_LSB para convertirlo a amperios.
+   Finalmente, Dato_Potencia se multiplica por POWER_LSB y los tres resultados se almacenan en las variables globales
+   Voltaje_Alimentacion, Corriente_Alimentacion y Potencia_Alimentacion para utilizarlos en los reportes.
+    */
+
+void INA219_Leer(void)
+{
+    uint16_t Dato_Voltaje;
+    uint16_t Dato_Corriente;
+    uint16_t Dato_Potencia;
+
+    // Lectura de los registros del INA219
+    Dato_Voltaje = INA219_Leer_Registro(REG_BUS_VOLTAGE);
+    Dato_Corriente = INA219_Leer_Registro(REG_CURRENT);
+    Dato_Potencia = INA219_Leer_Registro(REG_POWER);
+
+    // Conversion de los valores a unidades fisicas
+    Voltaje_Alimentacion =
+        ((Dato_Voltaje >> 3) * 0.004);
+
+    Corriente_Alimentacion =
+        ((int16_t)Dato_Corriente * CURRENT_LSB);
+
+    Potencia_Alimentacion =
+        (Dato_Potencia * POWER_LSB);
+}
+
+
+/* 
+   7.6 INICIALIZACION ADC ONE-SHOT
+   Este bloque configura el ADC One-shot para realizar conversiones analogicas solicitadas por el programa.
+   Primero, printf() muestra el inicio de la configuracion y se declara Configuracion_ADC para seleccionar la unidad
+   ADC definida en UNIDAD_ADC y deshabilitar el modo ULP.Despues, adc_oneshot_new_unit() crea el controlador ADC
+   y almacena su manejador en la variable ADC_OneShot. Posteriormente, se declara Configuracion_Canal para
+   establecer la atenuacion y resolucion de conversion. La funcion adc_oneshot_config_channel() utiliza esa
+   estructura junto con ADC_OneShot y CANAL_ADC para configurar el canal conectado al potenciometro.
+   Finalmente, printf() indica que la configuracion del ADC One-shot ha terminado.
+   */
+
+void ADC_OneShot_Init(void)
+{
+    printf("Inicializando ADC One-shot...\n");
+
+    // Configuracion de la unidad ADC
+    adc_oneshot_unit_init_cfg_t Configuracion_ADC = {
+        .unit_id = UNIDAD_ADC,
+        .ulp_mode = ADC_ULP_MODE_DISABLE
     };
 
     adc_oneshot_new_unit(
-        &Configuracion_Unidad,
+        &Configuracion_ADC,
         &ADC_OneShot
     );
 
+    // Configuracion del canal del potenciometro
     adc_oneshot_chan_cfg_t Configuracion_Canal = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN,
+        .atten = ATENUACION_ADC,
+        .bitwidth = RESOLUCION_ADC
     };
 
     adc_oneshot_config_channel(
         ADC_OneShot,
-        ADC_CHANNEL,
+        CANAL_ADC,
         &Configuracion_Canal
     );
+
+    printf("ADC One-shot configurado.\n");
 }
 
-/* =========================================================
-   LIBERAR ADC ONE-SHOT
-   ========================================================= */
 
-/*
-Esta función se utiliza cuando termina la prueba sin DMA. Como
-ya no se necesitan realizar más conversiones individuales, se
-elimina la unidad ADC que se había creado anteriormente y se
-asigna NULL a su identificador.
+/* 
+   7.7 INICIALIZACION ADC CONTINUOUS CON DMA
+   Este bloque configura el ADC Continuous para realizar conversiones continuas y transferir los datos mediante DMA.
+   Primero, printf() anuncia el inicio de la configuracion y se declara Configuracion_Manejador para establecer el
+   espacio maximo de almacenamiento y el tamano de cada bloque. Despues, adc_continuous_new_handle() crea el controlador
+   y guarda su manejador en ADC_DMA. Posteriormente, Patron_ADC define la atenuacion, el canal,
+   la unidad y la resolucion que utilizara cada conversion. Con esos parametros se declara Configuracion_Continua,
+   donde sample_freq_hz establece la frecuencia de muestreo, conv_mode define el modo de conversion y format determina
+el formato de los datos digitales recibidos. La instruccion adc_continuous_config() aplica esta
+   configuracion al controlador almacenado en ADC_DMA. Finalmente, Callbacks_ADC registra ADC_Overflow_Callback()
+   mediante adc_continuous_register_event_callbacks(), para contabilizar los desbordamientos que ocurran en el buffer.
+   */
 
-Esto permite finalizar el uso de esta configuración antes de
-continuar con la prueba que utiliza el modo continuo del ADC.
-*/
-
-static void ADC_Deinit(void)
+void ADC_DMA_Init(void)
 {
-    adc_oneshot_del_unit(ADC_OneShot);
-    ADC_OneShot = NULL;
-}
+    printf("\nConfigurando ADC Continuous con DMA...\n");
 
-/* =========================================================
-   ESTABILIZAR SISTEMA
-   ========================================================= */
+    // Configuracion del manejador DMA
+    adc_continuous_handle_cfg_t Configuracion_Manejador = {
+        .max_store_buf_size = TAMANO_POOL_ADC,
+        .conv_frame_size = TAMANO_BUFFER_ADC
+    };
 
-/*
-Antes de comenzar a guardar los resultados de cada prueba se
-realiza una etapa de estabilización de 10 segundos. Durante este
-tiempo se consulta el INA219 una vez por segundo y se muestran
-en la terminal los valores de voltaje, corriente y potencia.
-
-Esto permite observar cómo se comportan las mediciones eléctricas
-al inicio y dejar un tiempo de espera antes de comenzar a contar
-las muestras y calcular los resultados de cada método. Las lecturas
-realizadas durante esta etapa no se incluyen en los resultados
-principales de la prueba.
-*/
-
-static void Estabilizar_Sistema(void)
-{
-    printf("\nEstabilizando el sistema durante %d segundos...\n",
-           ESTABILIZACION_S);
-
-    for (int i = 1; i <= ESTABILIZACION_S; i++) {
-
-        INA219_Leer();
-
-        printf("[ESTAB] t=%d s | V=%.3f V | I=%.2f mA | P=%.2f mW\n",
-               i, Voltaje_Lectura, Corriente_Lectura, Potencia_Lectura);
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    printf("Estabilizacion finalizada.\n");
-}
-
-/* =========================================================
-   LEER REGISTRO DEL INA219
-   ========================================================= */
-
-/*
-Esta función permite consultar un registro específico del INA219.
-Para ello recibe la dirección del registro que se desea leer y
-envía esa dirección al sensor mediante la comunicación I2C.
-
-Después se reciben dos bytes de información, que se combinan
-para formar un solo valor de 16 bits. El resultado se devuelve
-para que otras funciones puedan utilizarlo en la conversión de
-los datos de voltaje y corriente.
-*/
-
-static uint16_t INA219_Leer_Registro(uint8_t Registro)
-{
-    uint8_t Datos[2] = {0};
-
-    i2c_master_transmit_receive(
-        INA219,
-        &Registro,
-        1,
-        Datos,
-        2,
-        1000
+    adc_continuous_new_handle(
+        &Configuracion_Manejador,
+        &ADC_DMA
     );
 
-    // Se unen los dos bytes recibidos para formar el valor completo del registro.
-    return ((uint16_t)Datos[0] << 8) | Datos[1];
+    // Configuracion del patron de conversion
+    adc_digi_pattern_config_t Patron_ADC = {
+        .atten = ATENUACION_ADC,
+        .channel = CANAL_ADC,
+        .unit = UNIDAD_ADC,
+        .bit_width = RESOLUCION_ADC
+    };
+
+    // Configuracion general de adquisicion continua
+    adc_continuous_config_t Configuracion_Continua = {
+        .sample_freq_hz = FRECUENCIA_ADC,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
+        .pattern_num = 1,
+        .adc_pattern = &Patron_ADC
+    };
+
+    adc_continuous_config(
+        ADC_DMA,
+        &Configuracion_Continua
+    );
+
+    // Registro del callback de desbordamiento
+    adc_continuous_evt_cbs_t Callbacks_ADC = {
+        .on_pool_ovf = ADC_Overflow_Callback
+    };
+
+    adc_continuous_register_event_callbacks(
+        ADC_DMA,
+        &Callbacks_ADC,
+        NULL
+    );
+
+    printf("ADC Continuous configurado.\n");
 }
 
-/* =========================================================
-   LEER VOLTAJE Y CORRIENTE DEL INA219
-   ========================================================= */
 
-/*
-Aquí se obtienen las mediciones eléctricas que proporciona el
-INA219. Primero se consulta el registro del voltaje del bus y
-después el registro de corriente. Los valores recibidos se
-convierten a unidades que facilitan su interpretación durante
-la evaluación.
-
-El voltaje se expresa en voltios y la corriente en miliamperios.
-Con estos dos valores también se calcula la potencia mediante
-su multiplicación, obteniendo el resultado en miliwatts. Los
-tres valores se guardan en variables globales para que puedan
-utilizarse en los reportes y en el cálculo del consumo.
-*/
-
-static void INA219_Leer(void)
-{
-    uint16_t Valor_Voltaje =
-        INA219_Leer_Registro(INA219_REG_BUSV);
-
-    int16_t Valor_Corriente =
-        (int16_t)INA219_Leer_Registro(INA219_REG_CURRENT);
-
-    Voltaje_Lectura =
-        ((Valor_Voltaje >> 3) * 4) / 1000.0f;
-
-    Corriente_Lectura =
-        Valor_Corriente * 0.1f;
-
-    Potencia_Lectura =
-        Voltaje_Lectura * Corriente_Lectura;
-}
-
-/* =========================================================
-   ACTUALIZAR ENERGIA Y MEDICIONES DEL INA219
-   ========================================================= */
-
-/*
-Esta función se encarga de guardar las mediciones eléctricas
-obtenidas durante cada prueba y calcular la energía acumulada.
-Primero se solicita una nueva lectura al INA219 y se obtiene
-el tiempo actual para conocer cuánto tiempo pasó desde la
-medición anterior.
-
-Para calcular la energía se utiliza el promedio de la potencia
-anterior y la actual, considerando también el tiempo transcurrido
-entre ambas lecturas. De esta manera se va acumulando la energía
-consumida durante toda la prueba, expresada en joules.
-
-Además, cada lectura de voltaje, corriente y potencia se suma
-a su respectivo acumulador. Estos valores se utilizarán al final
-para obtener los promedios de las mediciones realizadas.
-*/
-
-static void Actualizar_Energia(
-    Resultados_t *Resultados,
-    int64_t *Marca_Energia_us,
-    double *Potencia_Anterior
-)
-{
-    INA219_Leer();
-
-    int64_t Reloj_us = esp_timer_get_time();
-
-    double Intervalo_s =
-        (Reloj_us - *Marca_Energia_us) / 1000000.0;
-
-    if (Resultados->Lecturas_INA > 0) {
-
-        double Potencia_Promedio =
-            (*Potencia_Anterior + Potencia_Lectura) / 2.0;
-
-        Resultados->Energia_J +=
-            (Potencia_Promedio / 1000.0) * Intervalo_s;
-    }
-
-    *Potencia_Anterior = Potencia_Lectura;
-    *Marca_Energia_us = Reloj_us;
-
-    Resultados->Voltaje_Suma += Voltaje_Lectura;
-    Resultados->Corriente_Suma += Corriente_Lectura;
-    Resultados->Potencia_Suma += Potencia_Lectura;
-
-    Resultados->Lecturas_INA++;
-}
-
-/* =========================================================
-   FINALIZAR Y CALCULAR RESULTADOS
-   ========================================================= */
-
-/*
-Esta función reúne los datos obtenidos durante una prueba y
-realiza los cálculos necesarios para presentar sus resultados.
-Primero se obtiene la duración real utilizando el tiempo de inicio
-y el tiempo de finalización, y con esa información se calcula
-la frecuencia de adquisición dividiendo la cantidad de muestras
-entre los segundos que duró la prueba.
-
-También se calculan los promedios de voltaje, corriente y potencia
-a partir de las lecturas acumuladas del INA219. De manera similar,
-se obtiene el promedio de los valores del ADC y el tiempo promedio
-de procesamiento por muestra.
-
-Finalmente, se guarda el número de desbordamientos registrados
-durante la prueba. Con todos estos datos se completa la estructura
-de resultados para utilizarla posteriormente en la comparación.
-*/
-
-static void Finalizar_Resultados(
-    Resultados_t *Resultados,
-    int64_t Inicio_Prueba,
-    int64_t Fin_Prueba
-)
-{
-    int64_t Duracion_us = Fin_Prueba - Inicio_Prueba;
-
-    Resultados->Duracion_s =
-        Duracion_us / 1000000.0;
-
-    if (Resultados->Duracion_s > 0) {
-
-        Resultados->Frecuencia_Real_Hz =
-            Resultados->Muestras_ADC / Resultados->Duracion_s;
-    }
-
-    double Esperadas =
-        FRECUENCIA_EFECTIVA * Resultados->Duracion_s;
-
-    if (Esperadas > Resultados->Muestras_ADC) {
-
-        Resultados->Muestras_Perdidas =
-            (uint32_t)(Esperadas - Resultados->Muestras_ADC);
-    }
-
-    if (Resultados->Lecturas_INA > 0) {
-
-        Resultados->Voltaje_Promedio =
-            Resultados->Voltaje_Suma /
-            Resultados->Lecturas_INA;
-
-        Resultados->Corriente_Promedio =
-            Resultados->Corriente_Suma /
-            Resultados->Lecturas_INA;
-
-        Resultados->Potencia_Promedio =
-            Resultados->Potencia_Suma /
-            Resultados->Lecturas_INA;
-    }
-
-    if (Resultados->Muestras_ADC > 0) {
-
-        Resultados->Promedio_ADC =
-            (double)Resultados->Suma_ADC /
-            Resultados->Muestras_ADC;
-
-        Resultados->Tiempo_Procesamiento_Promedio_us =
-            Resultados->Tiempo_Procesamiento_ADC_us /
-            Resultados->Muestras_ADC;
-    }
-
-    Resultados->Desbordamientos = Desbordamientos_DMA;
-}
-
-/* =========================================================
-   MOSTRAR REPORTE PERIODICO
-   ========================================================= */
-
-/*
-Esta función permite observar cómo van cambiando los resultados
-mientras se está ejecutando cada prueba. Se utiliza tanto en el
-método sin DMA como en el método con DMA, por lo que recibe el
-nombre del modo que se está evaluando y la estructura donde se
-encuentran guardados sus datos.
-
-Antes de mostrar la información se calculan los promedios
-parciales de voltaje, corriente, potencia y ADC. También se
-obtiene el tiempo transcurrido y la frecuencia alcanzada hasta
-ese momento, dividiendo las muestras acumuladas entre el tiempo.
-
-Con estos datos se imprime un reporte en la terminal cada cinco
-segundos. Así se puede observar la cantidad de muestras obtenidas,
-sus valores mínimo y máximo, las mediciones eléctricas y la energía
-acumulada sin tener que esperar hasta que termine toda la prueba.
-*/
-
-static void Mostrar_Reporte(
-    const char *Modo,
-    Resultados_t *Resultados,
-    int64_t Transcurrido_us
-)
-{
-    double Voltaje_Promedio = 0;
-    double Corriente_Promedio = 0;
-    double Potencia_Promedio = 0;
-    double Promedio_ADC = 0;
-    double Perdidas = 0;
-
-    if (Resultados->Lecturas_INA > 0) {
-
-        Voltaje_Promedio =
-            Resultados->Voltaje_Suma /
-            Resultados->Lecturas_INA;
-
-        Corriente_Promedio =
-            Resultados->Corriente_Suma /
-            Resultados->Lecturas_INA;
-
-        Potencia_Promedio =
-            Resultados->Potencia_Suma /
-            Resultados->Lecturas_INA;
-    }
-
-    if (Resultados->Muestras_ADC > 0) {
-
-        Promedio_ADC =
-            (double)Resultados->Suma_ADC /
-            Resultados->Muestras_ADC;
-    }
-
-    double Segundos = Transcurrido_us / 1000000.0;
-
-    double Frecuencia = 0;
-
-    if (Segundos > 0) {
-        Frecuencia = Resultados->Muestras_ADC / Segundos;
-    }
-
-    double Esperadas = FRECUENCIA_EFECTIVA * Segundos;
-
-    if (Esperadas > Resultados->Muestras_ADC) {
-        Perdidas = Esperadas - Resultados->Muestras_ADC;
-    }
-
-    printf("\n---------- %s ----------\n", Modo);
-
-    printf("Tiempo: %.2f s\n", Segundos);
-
-    printf("Muestras ADC: %lu\n",
-           (unsigned long)Resultados->Muestras_ADC);
-
-    printf("Muestras perdidas: %.0f\n", Perdidas);
-
-    printf("Desbordamientos DMA: %lu\n",
-           (unsigned long)Desbordamientos_DMA);
-
-    printf("Frecuencia efectiva: %.2f Hz\n", Frecuencia);
-
-    printf("Promedio ADC: %.2f\n", Promedio_ADC);
-
-    printf("ADC minimo: %lu\n",
-           (unsigned long)Resultados->ADC_Minimo);
-
-    printf("ADC maximo: %lu\n",
-           (unsigned long)Resultados->ADC_Maximo);
-
-    printf("Voltaje promedio: %.3f V\n", Voltaje_Promedio);
-
-    printf("Corriente promedio: %.3f mA\n", Corriente_Promedio);
-
-    printf("Potencia promedio: %.3f mW\n", Potencia_Promedio);
-
-    printf("Energia acumulada: %.6f J\n",
-           Resultados->Energia_J);
-
-    printf("-------------------------------\n");
-}
-
-/* =========================================================
-   CALLBACK DE DESBORDAMIENTO DMA
-   ========================================================= */
-
-/*
-Esta función se utiliza como aviso cuando ocurre un desbordamiento
-en el almacenamiento de datos del ADC continuo. Esto puede suceder
-cuando se generan datos y el programa no alcanza a procesarlos antes
-de que el espacio disponible llegue a su límite.
-
-Cada vez que se presenta este evento, se aumenta el contador
-Desbordamientos_DMA. De esta manera, al terminar la prueba se
-puede consultar cuántas veces se presentó esta situación y tener
-una referencia sobre el comportamiento de la recepción de datos.
-*/
-
-static bool ADC_Desborde_Callback(
+/* 
+   7.8 CALLBACK DE DESBORDAMIENTO DMA
+   Este bloque define la funcion que se ejecuta cuando el controlador ADC Continuous notifica un desbordamiento.
+   Primero, se reciben Handle, Datos y Usuario como parametros proporcionados por el sistema de eventos del controlador.
+   Handle identifica el controlador ADC, Datos contiene la informacion del evento y Usuario permite recibir un dato
+   adicional asociado al registro del callback. El atributo IRAM_ATTR indica que la funcion puede ejecutarse
+   desde memoria interna, como se requiere para este callback. Despues, la instruccion Desbordamientos_DMA++ incrementa
+   el contador global cada vez que ocurre el evento. Finalmente, return false indica que el callback no solicita
+   una tarea de mayor prioridad para ser ejecutada al salir.
+   */
+
+static bool IRAM_ATTR ADC_Overflow_Callback(
     adc_continuous_handle_t Handle,
     const adc_continuous_evt_data_t *Datos,
     void *Usuario
 )
 {
+    // Se incrementa el contador cuando el buffer se desborda
     Desbordamientos_DMA++;
 
     return false;
 }
 
-/* =========================================================
-   PRUEBA SIN DMA: ADC ONE-SHOT
-   ========================================================= */
 
-/*
-En esta función se desarrolla la primera parte de la evaluación,
-utilizando el ADC en modo One-shot, es decir, solicitando cada
-conversión directamente desde el programa. Para comenzar se
-declara una estructura local donde se guardarán los resultados
-de esta prueba y se preparan las variables que se necesitan para
-calcular la energía y llevar el control de las mediciones.
+/* 
+   7.9 REPORTE DURANTE LAS ESTABILIZACIONES
+   Este bloque obtiene y presenta las mediciones actuales mientras el sistema permanece en una etapa de estabilizacion.
+   Primero, se declaran Valor_ADC, Voltaje_Potenciometro y Tiempo_Restante para almacenar la lectura analogica, su
+   conversion aproximada a voltaje y el tiempo pendiente. Despues, adc_oneshot_read() solicita una conversion del
+   canal CANAL_ADC y almacena el resultado en Valor_ADC. Posteriormente, se divide el valor ADC entre
+   VALOR_ADC_MAXIMO y se multiplica por VOLTAJE_REFERENCIA para calcular Voltaje_Potenciometro.
+   La funcion INA219_Leer() obtiene las variables electricas y actualiza las variables globales correspondientes.
+   Finalmente, las instrucciones printf() muestran el tiempo transcurrido, el tiempo restante, la lectura ADC, el
+   voltaje estimado del potenciometro y las mediciones del INA219 en el monitor serial.
+    */
 
-Después se configura el ADC y se realiza el periodo de estabilización
-de 10 segundos. Una vez terminado este tiempo, comienza el conteo
-de los 120 segundos de evaluación. Durante este periodo se realizan
-grupos de 10 lecturas individuales del potenciómetro. Cada conversión
-se mide con el temporizador para acumular el tiempo utilizado en
-la función de lectura.
-
-Con cada muestra se actualiza la cantidad total de lecturas, la
-suma de los valores y los valores mínimo y máximo del ADC. Además,
-se consulta el INA219 aproximadamente cada segundo para actualizar
-las mediciones eléctricas y el cálculo de energía.
-
-Cada cinco segundos se muestra un reporte con los resultados
-parciales. También se agrega una pausa de un milisegundo después
-de procesar cada grupo de lecturas. Cuando se cumplen los 120
-segundos, se realiza una última lectura del INA219, se libera
-el ADC y se calculan los resultados finales de esta prueba.
-
-Esta parte permite observar el comportamiento del método en el
-que el procesador solicita y obtiene las conversiones una por una.
-*/
-
-static Resultados_t Prueba_Sin_DMA(void)
+void Mostrar_Estado_Estabilizacion(int Tiempo)
 {
-    Resultados_t Resultados = {0};
-
-    double Potencia_Anterior = 0;
-
-    Resultados.ADC_Minimo = UINT32_MAX;
-    Desbordamientos_DMA = 0;
-
-    printf("\n========================================\n");
-    printf("     INICIANDO PRUEBA ADC SIN DMA\n");
-    printf("========================================\n");
-
-    ADC_Init();
-
-    Estabilizar_Sistema();
-
-    int64_t Inicio_Prueba = esp_timer_get_time();
-
-    int64_t Ultima_Lectura_INA_us = Inicio_Prueba;
-    int64_t Ultimo_Resumen_us = Inicio_Prueba;
-    int64_t Marca_Energia_us = Inicio_Prueba;
-
     int Valor_ADC = 0;
+    double Voltaje_Potenciometro;
+    int Tiempo_Restante = TIEMPO_ESTABILIZACION - Tiempo;
 
-    Actualizar_Energia(
-        &Resultados,
-        &Marca_Energia_us,
-        &Potencia_Anterior
+    // Lectura del potenciometro mediante ADC One-shot
+    adc_oneshot_read(
+        ADC_OneShot,
+        CANAL_ADC,
+        &Valor_ADC
     );
 
-    while ((esp_timer_get_time() - Inicio_Prueba) < DURACION_PRUEBA) {
+    Voltaje_Potenciometro =
+        ((double)Valor_ADC / VALOR_ADC_MAXIMO)
+        * VOLTAJE_REFERENCIA;
 
-        for (int i = 0; i < MUESTRAS_POR_BLOQUE; i++) {
+    // Lectura de las variables electricas del INA219
+    INA219_Leer();
 
-            int64_t Inicio_Conversion = esp_timer_get_time();
+    // Reporte del tiempo y de las mediciones actuales
+    printf("\nTiempo de estabilizacion: %d/%d s\n",
+           Tiempo,
+           TIEMPO_ESTABILIZACION);
 
-            adc_oneshot_read(
-                ADC_OneShot,
-                ADC_CHANNEL,
-                &Valor_ADC
-            );
+    printf("Tiempo restante: %d s\n",
+           Tiempo_Restante);
 
-            int64_t Fin_Conversion = esp_timer_get_time();
+    printf("ADC potenciometro: %d\n",
+           Valor_ADC);
 
-            Resultados.Tiempo_Procesamiento_ADC_us +=
-                Fin_Conversion - Inicio_Conversion;
+    printf("Voltaje potenciometro estimado: %.3f V\n",
+           Voltaje_Potenciometro);
 
-            Resultados.Muestras_ADC++;
+    printf("Voltaje alimentacion: %.3f V\n",
+           Voltaje_Alimentacion);
 
-            Resultados.Suma_ADC += Valor_ADC;
+    printf("Corriente: %.3f mA\n",
+           Corriente_Alimentacion * 1000.0);
 
-            if ((uint32_t)Valor_ADC < Resultados.ADC_Minimo) {
-                Resultados.ADC_Minimo = Valor_ADC;
-            }
-
-            if ((uint32_t)Valor_ADC > Resultados.ADC_Maximo) {
-                Resultados.ADC_Maximo = Valor_ADC;
-            }
-        }
-
-        Resultados.Bloques++;
-
-        int64_t Reloj_us = esp_timer_get_time();
-
-        if ((Reloj_us - Ultima_Lectura_INA_us) >= 1000000LL) {
-
-            Actualizar_Energia(
-                &Resultados,
-                &Marca_Energia_us,
-                &Potencia_Anterior
-            );
-
-            Ultima_Lectura_INA_us = Reloj_us;
-        }
-
-        if ((Reloj_us - Ultimo_Resumen_us) >= 5000000LL) {
-
-            Mostrar_Reporte(
-                "ADC SIN DMA",
-                &Resultados,
-                Reloj_us - Inicio_Prueba
-            );
-
-            Ultimo_Resumen_us = Reloj_us;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    Actualizar_Energia(
-        &Resultados,
-        &Marca_Energia_us,
-        &Potencia_Anterior
-    );
-
-    int64_t Fin_Prueba = esp_timer_get_time();
-
-    ADC_Deinit();
-
-    Finalizar_Resultados(
-        &Resultados,
-        Inicio_Prueba,
-        Fin_Prueba
-    );
-
-    printf("\nFINALIZO LA PRUEBA SIN DMA\n");
-
-    return Resultados;
+    printf("Potencia: %.3f mW\n",
+           Potencia_Alimentacion * 1000.0);
 }
 
-/* =========================================================
-   PRUEBA CON DMA: ADC CONTINUOUS
-   ========================================================= */
 
-/*
-En esta función se desarrolla la segunda parte de la evaluación,
-pero ahora utilizando el ADC en modo continuo con DMA. A diferencia
-del método anterior, aquí no se solicita cada conversión de manera
-individual, sino que el ADC realiza las adquisiciones de forma
-continua y los datos se van almacenando para que el programa pueda
-recuperarlos y procesarlos por bloques.
+/* 
+   7.10 ESTABILIZACION INICIAL
+   Este bloque mantiene el sistema durante el tiempo de estabilizacion establecido en TIEMPO_ESTABILIZACION.
+   Primero, se declara la variable Tiempo, que funciona como contador de los segundos transcurridos en esta etapa.
+   Despues, printf() presenta el encabezado que identifica el comienzo de la estabilizacion inicial en el monitor.
+   Posteriormente, el ciclo for comienza en el segundo uno y se repite mientras Tiempo sea menor o igual al tiempo
+   definido en TIEMPO_ESTABILIZACION. En cada repeticion, vTaskDelay() introduce una espera de
+   1000 milisegundos y posteriormente se llama a Mostrar_Estado_Estabilizacion() para realizar las lecturas
+   del potenciometro y del INA219. Finalmente, cuando el contador alcanza el tiempo definido,
+   termina el ciclo y la funcion permite continuar con la siguiente etapa de la maquina de estados.
+    */
 
-Primero se prepara el almacenamiento que recibirá las muestras y
-se configura el ADC con una frecuencia de 20,000 muestras por segundo.
-También se establece el canal conectado al potenciómetro y el formato
-en el que se recibirán los datos. Se registra una función que permite
-contar los desbordamientos que puedan ocurrir durante la adquisición.
-
-Después de realizar la estabilización de 10 segundos, se inicia la
-adquisición continua y comienza el conteo de los 120 segundos.
-Durante la prueba, el programa solicita los datos almacenados y
-los coloca temporalmente en un buffer para poder recorrerlos.
-
-Cada bloque recibido se procesa para obtener los valores del ADC.
-Se utiliza la decimación de dos, por lo que solamente se conserva
-una de cada dos muestras recibidas. Las muestras seleccionadas
-se suman y se utilizan para actualizar el promedio, así como los
-valores mínimo y máximo.
-
-Al igual que en la prueba anterior, el INA219 se consulta aproximadamente
-cada segundo y se muestran reportes parciales cada cinco segundos.
-También se mide el tiempo utilizado para procesar los bloques
-recibidos. Cuando se cumple el tiempo establecido, se realiza una
-última lectura eléctrica, se detiene la adquisición continua y se
-liberan los recursos utilizados por el DMA.
-
-Con esta prueba se busca observar el comportamiento del ADC cuando
-las conversiones se realizan de manera continua y el movimiento
-de los datos se apoya en DMA.
-*/
-
-static Resultados_t Prueba_Con_DMA(void)
+void Estabilizacion(void)
 {
-    Resultados_t Resultados = {0};
-
-    double Potencia_Anterior = 0;
-
-    Resultados.ADC_Minimo = UINT32_MAX;
-    Desbordamientos_DMA = 0;
+    int Tiempo;
 
     printf("\n========================================\n");
-    printf("     INICIANDO PRUEBA ADC CON DMA\n");
+    printf("       ESTABILIZACION INICIAL\n");
     printf("========================================\n");
 
-    adc_continuous_handle_t Handle_DMA = NULL;
+    // Mostrar las mediciones una vez por segundo
+    for (Tiempo = 1;
+         Tiempo <= TIEMPO_ESTABILIZACION;
+         Tiempo++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Mostrar_Estado_Estabilizacion(Tiempo);
+    }
+}
 
-    adc_continuous_handle_cfg_t Configuracion_DMA = {
-        .max_store_buf_size = BUFFER_DMA,
-        .conv_frame_size = TAMANO_BLOQUE,
-    };
 
-    adc_continuous_new_handle(
-        &Configuracion_DMA,
-        &Handle_DMA
+/* 
+   7.11 PREPARACION Y ESTABILIZACION PARA DMA
+   Este bloque prepara el sistema para ejecutar la segunda prueba utilizando ADC Continuous con transferencia DMA.
+   Primero, se declara Tiempo para contar los segundos de estabilizacion que se realizan antes de iniciar la prueba.
+   Despues, printf() muestra el encabezado de esta etapa y memset() reinicia todos los campos de Resultado_Actual.
+   Tambien se ponen en cero los acumuladores del potenciometro, las variables de energia y el contador de desbordamientos.
+   Posteriormente, el ciclo for mantiene una estabilizacion de TIEMPO_ESTABILIZACION segundos, utilizando vTaskDelay()
+   y Mostrar_Estado_Estabilizacion() para presentar las mediciones actuales durante ese periodo.
+   Una vez finalizado el ciclo, adc_oneshot_del_unit() libera el controlador One-shot y ADC_OneShot se establece en NULL.
+   Finalmente, ADC_DMA_Init() configura el nuevo controlador que se utilizara durante la adquisicion continua con DMA.
+    */
+
+void Preparar_DMA(void)
+{
+    int Tiempo;
+
+    printf("\n========================================\n");
+    printf("       ESTABILIZACION PARA DMA\n");
+    printf("========================================\n");
+
+    // Reinicio de las variables de adquisicion
+    memset(
+        &Resultado_Actual,
+        0,
+        sizeof(Resultado_Actual)
     );
 
-    adc_digi_pattern_config_t Patron_ADC = {
-        .atten = ADC_ATTEN,
-        .channel = ADC_CHANNEL,
-        .unit = ADC_UNIT_1,
-        .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH,
-    };
+    Suma_ADC_Reporte = 0;
+    Muestras_ADC_Reporte = 0;
 
-    adc_continuous_config_t Configuracion_ADC = {
-        .sample_freq_hz = FRECUENCIA_DMA,
-        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
-        .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
-        .pattern_num = 1,
-        .adc_pattern = &Patron_ADC,
-    };
+    Energia_J = 0;
+    Potencia_Anterior = 0;
+    Tiempo_Energia_Anterior = 0;
 
-    adc_continuous_config(
-        Handle_DMA,
-        &Configuracion_ADC
+    Desbordamientos_DMA = 0;
+
+    // Mostrar las mediciones una vez por segundo
+    for (Tiempo = 1;
+         Tiempo <= TIEMPO_ESTABILIZACION;
+         Tiempo++)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Mostrar_Estado_Estabilizacion(Tiempo);
+    }
+
+    // Liberar One-shot despues de terminar la estabilizacion
+    adc_oneshot_del_unit(ADC_OneShot);
+    ADC_OneShot = NULL;
+
+    // Configurar el ADC Continuous con DMA
+    ADC_DMA_Init();
+}
+
+
+/* 
+   7.12 REGISTRO DE MUESTRAS ADC
+   Este bloque centraliza el registro de las muestras que se obtienen mediante cualquiera de los dos metodos ADC.
+   Primero, la funcion recibe Valor_ADC como parametro, que contiene el resultado digital de una conversion.
+   Despues, Resultado_Actual.Muestras_Totales se incrementa para contabilizar una nueva muestra procesada.
+   Posteriormente, el valor recibido se suma a Suma_ADC_Reporte y se incrementa Muestras_ADC_Reporte para mantener el
+   acumulado y el numero de muestras del intervalo actual. Finalmente, estos dos acumuladores permiten que
+   Mostrar_Reporte() calcule el promedio del potenciometro correspondiente al intervalo de reporte.
+    */
+
+void Registrar_Muestra(int Valor_ADC)
+{
+    // Acumulacion de muestras para calcular el promedio
+    Resultado_Actual.Muestras_Totales++;
+
+    Suma_ADC_Reporte += Valor_ADC;
+    Muestras_ADC_Reporte++;
+}
+
+
+/* 
+   7.13 ACTUALIZACION DE LAS MEDICIONES INA219
+   Este bloque realiza una nueva lectura del sensor INA219, acumula las variables electricas y calcula la energia.
+   Primero, se declara Tiempo_Actual para guardar el instante en que se realiza la medicion mediante el temporizador.
+   Despues, INA219_Leer() actualiza el voltaje, corriente y potencia almacenados en las variables globales.
+   Posteriormente, estos tres valores se agregan a sus respectivos acumuladores dentro de Resultado_Actual y
+   Lecturas_INA se incrementa para contabilizar la lectura. La funcion esp_timer_get_time() obtiene el tiempo actual
+   en microsegundos para calcular el intervalo transcurrido. Si Tiempo_Energia_Anterior es diferente de cero, se calcula
+   Diferencia_Tiempo en segundos y se integra la potencia mediante el promedio entre la potencia anterior y actual.
+   Finalmente, Potencia_Anterior y Tiempo_Energia_Anterior se actualizan para utilizarlos en la siguiente medicion.
+    */
+
+void Actualizar_Alimentacion(void)
+{
+    int64_t Tiempo_Actual;
+
+    // Lectura de las variables electricas
+    INA219_Leer();
+
+    Resultado_Actual.Suma_Voltaje +=
+        Voltaje_Alimentacion;
+
+    Resultado_Actual.Suma_Corriente +=
+        Corriente_Alimentacion;
+
+    Resultado_Actual.Suma_Potencia +=
+        Potencia_Alimentacion;
+
+    Resultado_Actual.Lecturas_INA++;
+
+    // Integracion de potencia para calcular energia
+    Tiempo_Actual = esp_timer_get_time();
+
+    if (Tiempo_Energia_Anterior != 0)
+    {
+        double Diferencia_Tiempo =
+            (Tiempo_Actual - Tiempo_Energia_Anterior)
+            / 1000000.0;
+
+        Energia_J +=
+            ((Potencia_Anterior + Potencia_Alimentacion) / 2.0)
+            * Diferencia_Tiempo;
+    }
+
+    Potencia_Anterior = Potencia_Alimentacion;
+    Tiempo_Energia_Anterior = Tiempo_Actual;
+}
+
+
+/* 
+   7.14 REPORTE PERIODICO DEL EXPERIMENTO
+   Este bloque calcula el promedio de las muestras ADC registradas durante el intervalo y presenta los resultados.
+   Primero, se declara Promedio_ADC y se inicializa en cero para almacenar el promedio del potenciometro.
+   Despues, la condicion if comprueba que Muestras_ADC_Reporte sea mayor que cero, evitando realizar una division entre
+   cero cuando no existan muestras registradas.Posteriormente, se divide Suma_ADC_Reporte entre
+   Muestras_ADC_Reporte y se almacena el resultado en Promedio_ADC.
+   La instruccion printf() presenta el tiempo del reporte, el total de muestras, el promedio ADC y las mediciones
+   actuales de voltaje, corriente, potencia y energia. Finalmente, Suma_ADC_Reporte y Muestras_ADC_Reporte se
+   reinician para comenzar a acumular las muestras del siguiente intervalo de reporte.
+    */
+
+void Mostrar_Reporte(int Tiempo)
+{
+    double Promedio_ADC = 0;
+
+    // Calculo del promedio de las muestras del intervalo
+    if (Muestras_ADC_Reporte > 0)
+    {
+        Promedio_ADC =
+            (double)Suma_ADC_Reporte / Muestras_ADC_Reporte;
+    }
+
+    printf("%5d | %10" PRIu64 " | %8.0f | %6.3f | %8.3f | %8.3f | %8.4f\n",
+           Tiempo,
+           Resultado_Actual.Muestras_Totales,
+           Promedio_ADC,
+           Voltaje_Alimentacion,
+           Corriente_Alimentacion * 1000.0,
+           Potencia_Alimentacion * 1000.0,
+           Energia_J);
+
+    // Reinicio del promedio del potenciometro para el siguiente intervalo
+    Suma_ADC_Reporte = 0;
+    Muestras_ADC_Reporte = 0;
+}
+
+
+/* 
+   7.15 PRUEBA ADC ONE-SHOT
+   Este bloque realiza la primera adquisicion del experimento utilizando el controlador ADC One-shot, que solicita cada
+   conversion mediante una llamada directa del programa. Primero, se declaran las variables para almacenar la
+   lectura ADC, los tiempos de inicio, ejecucion y finalizacion, los intervalos de reporte e INA219 y el tiempo de proceso.
+   Despues, Tiempo_Mostrar establece el primer segundo que aparecera en la tabla y memset() reinicia Resultado_Actual.
+   Tambien se reinician los acumuladores de muestras y energia para comenzar la prueba sin conservar datos anteriores.
+   Posteriormente, printf() presenta el encabezado de la tabla y esp_timer_get_time() establece el instante inicial.
+   Con ese valor se calculan Tiempo_Reporte y Tiempo_INA, que determinan cuando deben realizarse las siguientes
+   actualizaciones del sensor y los reportes por UART.
+   Dentro del ciclo while se compara el tiempo transcurrido con TIEMPO_PRUEBA para mantener la adquisicion durante
+   los 120 segundos establecidos. En cada iteracion se obtiene el tiempo inicial de proceso, adc_oneshot_read() solicita una conversion del canal ADC
+   y Registrar_Muestra() contabiliza el valor obtenido. Despues se acumula el tiempo de procesamiento y se
+   incrementa Bloques_Procesados para registrar cada ciclo. La condicion relacionada con Tiempo_INA ejecuta
+   Actualizar_Alimentacion() cada segundo, mientras que Tiempo_Reporte permite llamar a Mostrar_Reporte() cada
+   cinco segundos y avanzar los intervalos correspondientes. Finalmente, al terminar el ciclo se registra la duracion
+   efectiva, se llama a Calcular_Resultados() y se copia Resultado_Actual en Resultado_OneShot para conservar
+   los resultados de esta primera prueba.
+    */
+
+void Prueba_Sin_DMA(void)
+{
+    int Valor_ADC = 0;
+
+    int64_t Tiempo_Inicio;
+    int64_t Tiempo_Actual;
+    int64_t Tiempo_Fin;
+
+    int64_t Tiempo_Reporte;
+    int64_t Tiempo_INA;
+
+    int64_t Tiempo_Procesamiento_Inicio;
+
+    int Tiempo_Mostrar = 5;
+
+    // Reinicio de resultados y acumuladores
+    memset(
+        &Resultado_Actual,
+        0,
+        sizeof(Resultado_Actual)
     );
 
-    adc_continuous_evt_cbs_t Callbacks_DMA = {
-        .on_pool_ovf = ADC_Desborde_Callback,
-    };
+    Suma_ADC_Reporte = 0;
+    Muestras_ADC_Reporte = 0;
 
-    adc_continuous_register_event_callbacks(
-        Handle_DMA,
-        &Callbacks_DMA,
-        NULL
+    Energia_J = 0;
+    Potencia_Anterior = 0;
+    Tiempo_Energia_Anterior = 0;
+
+    // Inicio de la prueba
+    printf("\n========== TABLA ADC ONE-SHOT SIN DMA  ==========\n");
+    printf("Duracion programada: %d s\n", TIEMPO_PRUEBA);
+    printf(" Tiempo |  Muestras | ADC prom. | V (V)   | I(mA)   | P(mW)   | E(J)\n");
+    printf("--------+-----------+-----------+---------+---------+---------+-----\n");
+
+    Tiempo_Inicio = esp_timer_get_time();
+
+    Tiempo_Reporte =
+        Tiempo_Inicio + INTERVALO_REPORTE;
+
+    Tiempo_INA =
+        Tiempo_Inicio + INTERVALO_INA;
+
+    // Adquisicion continua mediante conversiones solicitadas por software
+    while ((esp_timer_get_time() - Tiempo_Inicio)
+           < (TIEMPO_PRUEBA * 1000000LL))
+    {
+        Tiempo_Procesamiento_Inicio = esp_timer_get_time();
+
+        adc_oneshot_read(
+            ADC_OneShot,
+            CANAL_ADC,
+            &Valor_ADC
+        );
+
+        Registrar_Muestra(Valor_ADC);
+
+        Resultado_Actual.Tiempo_Procesamiento +=
+            esp_timer_get_time() - Tiempo_Procesamiento_Inicio;
+
+        Resultado_Actual.Bloques_Procesados++;
+
+        Tiempo_Actual = esp_timer_get_time();
+
+        // Lectura del INA219 cada segundo
+        if (Tiempo_Actual >= Tiempo_INA)
+        {
+            Actualizar_Alimentacion();
+
+            Tiempo_INA += INTERVALO_INA;
+        }
+
+        // Reporte por UART cada cinco segundos
+        if (Tiempo_Actual >= Tiempo_Reporte)
+        {
+            Mostrar_Reporte(Tiempo_Mostrar);
+
+            Tiempo_Reporte += INTERVALO_REPORTE;
+            Tiempo_Mostrar += 5;
+        }
+    }
+
+    // Registrar la duracion efectiva de la prueba
+    Tiempo_Fin = esp_timer_get_time();
+
+    Resultado_Actual.Duracion_Efectiva =
+        (Tiempo_Fin - Tiempo_Inicio) / 1000000.0;
+
+    // Calculo de los resultados de One-shot
+    Calcular_Resultados();
+
+    Resultado_OneShot = Resultado_Actual;
+
+    printf("\nPRUEBA SIN DMA FINALIZADA.\n");
+}
+
+
+/* 
+   7.16 PRUEBA ADC CONTINUOUS CON DMA
+   Este bloque realiza la segunda adquisicion utilizando
+   ADC Continuous, donde las conversiones se transfieren
+   mediante DMA hacia un buffer de almacenamiento.
+   Primero, se declara Buffer_ADC para recibir los datos,
+   Longitud_Leida para conocer cuantos bytes se recibieron
+   e Indice para recorrer las posiciones del buffer.
+   Tambien se declaran las variables de tiempo utilizadas
+   para controlar la duracion, los reportes y las lecturas INA.
+   Despues, memset() reinicia Resultado_Actual y se ponen
+   en cero los acumuladores de muestras, energia y
+   desbordamientos para iniciar esta prueba independientemente.
+   Posteriormente, printf() presenta el encabezado de la tabla
+   y adc_continuous_start() inicia las conversiones continuas.
+   esp_timer_get_time() establece el tiempo inicial y permite
+   calcular los instantes de los siguientes reportes y
+   actualizaciones del INA219.
+   Dentro del ciclo while se comprueba que no se haya
+   alcanzado la duracion definida en TIEMPO_PRUEBA.
+   En cada iteracion, Longitud_Leida se reinicia y
+   adc_continuous_read() solicita los datos disponibles
+   para almacenarlos en Buffer_ADC.
+   Si Longitud_Leida es mayor que cero, comienza el
+   procesamiento del bloque recibido y el ciclo for recorre
+   el buffer avanzando segun SOC_ADC_DIGI_RESULT_BYTES.
+   En cada posicion se interpreta la informacion mediante
+   adc_digi_output_data_t y se obtiene el valor digital de
+   12 bits desde Dato_ADC->type1.data.
+   Registrar_Muestra() contabiliza cada conversion recibida,
+   mientras que Tiempo_Procesamiento y Bloques_Procesados
+   registran el tiempo y la cantidad de bloques procesados.
+   Posteriormente, las condiciones if actualizan el INA219
+   cada segundo y muestran los reportes cada cinco segundos.
+   Finalmente, se calcula la duracion efectiva, se ejecuta
+   Calcular_Resultados(), se guarda el contador de
+   desbordamientos y se copia la estructura en Resultado_DMA.
+    */
+
+void Prueba_Con_DMA(void)
+{
+    uint8_t Buffer_ADC[TAMANO_BUFFER_ADC];
+
+    uint32_t Longitud_Leida = 0;
+
+    uint32_t Indice;
+
+    int64_t Tiempo_Inicio;
+    int64_t Tiempo_Actual;
+    int64_t Tiempo_Fin;
+
+    int64_t Tiempo_Reporte;
+    int64_t Tiempo_INA;
+
+    int64_t Tiempo_Procesamiento_Inicio;
+
+    int Tiempo_Mostrar = 5;
+
+    // Reinicio de resultados y acumuladores
+    memset(
+        &Resultado_Actual,
+        0,
+        sizeof(Resultado_Actual)
     );
 
-    Estabilizar_Sistema();
+    Suma_ADC_Reporte = 0;
+    Muestras_ADC_Reporte = 0;
 
-    adc_continuous_start(Handle_DMA);
+    Energia_J = 0;
+    Potencia_Anterior = 0;
+    Tiempo_Energia_Anterior = 0;
 
-    int64_t Inicio_Prueba = esp_timer_get_time();
+    Desbordamientos_DMA = 0;
 
-    int64_t Ultima_Lectura_INA_us = Inicio_Prueba;
-    int64_t Ultimo_Resumen_us = Inicio_Prueba;
-    int64_t Marca_Energia_us = Inicio_Prueba;
+    // Inicio de la prueba
+    printf("\n========== TABLA ADC  CON DMA ==========\n");
+    printf("Frecuencia configurada: %d Hz | Duracion: %d s\n",
+           FRECUENCIA_ADC, TIEMPO_PRUEBA);
+    printf(" Tiempo |  Muestras | ADC prom. | V(V) | I(mA)   | P(mW)   | E(J)\n");
+    printf("--------+-----------+-----------+---------+---------+---------+---------\n");
 
-    // Espacio temporal donde se colocan los datos recibidos en cada lectura del DMA.
-    uint8_t Buffer_ADC[TAMANO_BLOQUE];
+    // Inicio de la adquisicion continua
+    adc_continuous_start(ADC_DMA);
 
-    uint32_t Bytes_Recibidos = 0;
+    Tiempo_Inicio = esp_timer_get_time();
 
-    // Lleva el control para conservar una muestra por cada dos recibidas.
-    uint32_t Contador_Decimacion = 0;
+    Tiempo_Reporte =
+        Tiempo_Inicio + INTERVALO_REPORTE;
 
-    Actualizar_Energia(
-        &Resultados,
-        &Marca_Energia_us,
-        &Potencia_Anterior
-    );
+    Tiempo_INA =
+        Tiempo_Inicio + INTERVALO_INA;
 
-    while ((esp_timer_get_time() - Inicio_Prueba) < DURACION_PRUEBA) {
-
-        Bytes_Recibidos = 0;
+    // Lectura y procesamiento de los bloques transferidos por DMA
+    while ((esp_timer_get_time() - Tiempo_Inicio)
+           < (TIEMPO_PRUEBA * 1000000LL))
+    {
+        Longitud_Leida = 0;
 
         adc_continuous_read(
-            Handle_DMA,
+            ADC_DMA,
             Buffer_ADC,
-            sizeof(Buffer_ADC),
-            &Bytes_Recibidos,
+            TAMANO_BUFFER_ADC,
+            &Longitud_Leida,
             100
         );
 
-        if (Bytes_Recibidos > 0) {
+        // Procesamiento de las conversiones recibidas
+        if (Longitud_Leida > 0)
+        {
+            Tiempo_Procesamiento_Inicio = esp_timer_get_time();
 
-            int64_t Inicio_Procesamiento = esp_timer_get_time();
-
-            uint32_t Numero_Muestras =
-                Bytes_Recibidos / SOC_ADC_DIGI_RESULT_BYTES;
-
-            for (uint32_t i = 0; i < Numero_Muestras; i++) {
-
+            for (Indice = 0;
+                 Indice < Longitud_Leida;
+                 Indice += SOC_ADC_DIGI_RESULT_BYTES)
+            {
                 adc_digi_output_data_t *Dato_ADC =
-                    (adc_digi_output_data_t *)
-                    &Buffer_ADC[i * SOC_ADC_DIGI_RESULT_BYTES];
+                    (adc_digi_output_data_t *)&Buffer_ADC[Indice];
 
-                Resultados.Muestras_ADC_Raw++;
+                // Lectura del valor digital de 12 bits
+                int Valor_ADC = Dato_ADC->type1.data;
 
-                Contador_Decimacion++;
-
-                if ((Contador_Decimacion % DECIMACION) == 0) {
-
-                    uint32_t Valor_ADC = Dato_ADC->type1.data;
-
-                    Resultados.Muestras_ADC++;
-
-                    Resultados.Suma_ADC += Valor_ADC;
-
-                    if (Valor_ADC < Resultados.ADC_Minimo) {
-                        Resultados.ADC_Minimo = Valor_ADC;
-                    }
-
-                    if (Valor_ADC > Resultados.ADC_Maximo) {
-                        Resultados.ADC_Maximo = Valor_ADC;
-                    }
-                }
+                Registrar_Muestra(Valor_ADC);
             }
 
-            int64_t Fin_Procesamiento = esp_timer_get_time();
+            Resultado_Actual.Tiempo_Procesamiento +=
+                esp_timer_get_time() - Tiempo_Procesamiento_Inicio;
 
-            Resultados.Tiempo_Procesamiento_ADC_us +=
-                Fin_Procesamiento - Inicio_Procesamiento;
-
-            Resultados.Bloques++;
+            Resultado_Actual.Bloques_Procesados++;
         }
 
-        int64_t Reloj_us = esp_timer_get_time();
+        Tiempo_Actual = esp_timer_get_time();
 
-        if ((Reloj_us - Ultima_Lectura_INA_us) >= 1000000LL) {
+        // Lectura del INA219 cada segundo
+        if (Tiempo_Actual >= Tiempo_INA)
+        {
+            Actualizar_Alimentacion();
 
-            Actualizar_Energia(
-                &Resultados,
-                &Marca_Energia_us,
-                &Potencia_Anterior
-            );
-
-            Ultima_Lectura_INA_us = Reloj_us;
+            Tiempo_INA += INTERVALO_INA;
         }
 
-        if ((Reloj_us - Ultimo_Resumen_us) >= 5000000LL) {
+        // Reporte por UART cada cinco segundos
+        if (Tiempo_Actual >= Tiempo_Reporte)
+        {
+            Mostrar_Reporte(Tiempo_Mostrar);
 
-            Mostrar_Reporte(
-                "ADC CON DMA",
-                &Resultados,
-                Reloj_us - Inicio_Prueba
-            );
-
-            Ultimo_Resumen_us = Reloj_us;
+            Tiempo_Reporte += INTERVALO_REPORTE;
+            Tiempo_Mostrar += 5;
         }
     }
 
-    Actualizar_Energia(
-        &Resultados,
-        &Marca_Energia_us,
-        &Potencia_Anterior
-    );
+    // Registrar la duracion efectiva de la prueba
+    Tiempo_Fin = esp_timer_get_time();
 
-    int64_t Fin_Prueba = esp_timer_get_time();
+    Resultado_Actual.Duracion_Efectiva =
+        (Tiempo_Fin - Tiempo_Inicio) / 1000000.0;
 
-    adc_continuous_stop(Handle_DMA);
+    // Calculo de los resultados de DMA
+    Calcular_Resultados();
 
-    adc_continuous_deinit(Handle_DMA);
+    Resultado_Actual.Desbordamientos =
+        Desbordamientos_DMA;
 
-    Finalizar_Resultados(
-        &Resultados,
-        Inicio_Prueba,
-        Fin_Prueba
-    );
+    Resultado_DMA = Resultado_Actual;
 
-    printf("\nFINALIZO LA PRUEBA CON DMA\n");
+    printf("\nDesbordamientos DMA: %" PRIu32 "\n",
+           Resultado_DMA.Desbordamientos);
 
-    return Resultados;
+    printf("PRUEBA CON DMA FINALIZADA.\n");
 }
 
-/* =========================================================
-   COMPARACION FINAL DE LAS DOS PRUEBAS
-   ========================================================= */
 
-/*
-Esta es la última función del programa y se encarga de mostrar
-en una misma tabla los resultados obtenidos durante las dos
-pruebas. Se comparan los valores de voltaje, corriente y potencia
-promedio, así como la energía acumulada durante los 120 segundos
-de cada método.
+/* 
+   7.17 CALCULO DE RESULTADOS
+   Este bloque obtiene los promedios de las variables
+   electricas y almacena la energia acumulada durante la prueba.
+   Primero, la condicion if comprueba que Lecturas_INA sea
+   mayor que cero para determinar si existen mediciones
+   electricas que puedan utilizarse en los calculos.
+   Despues, se divide Suma_Voltaje entre Lecturas_INA para
+   obtener Voltaje_Promedio dentro de Resultado_Actual.
+   De la misma manera, Suma_Corriente y Suma_Potencia se
+   dividen entre el numero de lecturas para obtener sus
+   respectivos promedios electricos.
+   Finalmente, Energia_J se asigna a Energia_Total para
+   conservar la energia calculada mediante la integracion
+   de potencia durante el desarrollo del experimento.
+    */
 
-También se muestran la cantidad de muestras válidas, las muestras
-perdidas calculadas, la frecuencia efectiva alcanzada y el tiempo
-promedio de procesamiento por muestra. En el caso de los
-desbordamientos DMA, se muestra el resultado correspondiente
-a la prueba continua, ya que ese contador se utiliza para observar
-los problemas de almacenamiento que pueden presentarse en ese modo.
-
-Por último, se calcula el porcentaje de reducción de energía al
-utilizar DMA, tomando como referencia el consumo registrado en
-la prueba sin DMA. Esto permite observar si existe una diferencia
-en el consumo eléctrico entre ambos métodos y tener una referencia
-para analizar sus resultados.
-*/
-
-static void Mostrar_Comparacion(void)
+void Calcular_Resultados(void)
 {
-    double Reduccion_Energia = 0;
+    // Calculo de los promedios electricos
+    if (Resultado_Actual.Lecturas_INA > 0)
+    {
+        Resultado_Actual.Voltaje_Promedio =
+            Resultado_Actual.Suma_Voltaje /
+            Resultado_Actual.Lecturas_INA;
 
-    if (Resultados_Sin_DMA.Energia_J > 0) {
-        Reduccion_Energia =
-            ((Resultados_Sin_DMA.Energia_J - Resultados_Con_DMA.Energia_J) /
-            Resultados_Sin_DMA.Energia_J) * 100.0;
+        Resultado_Actual.Corriente_Promedio =
+            Resultado_Actual.Suma_Corriente /
+            Resultado_Actual.Lecturas_INA;
+
+        Resultado_Actual.Potencia_Promedio =
+            Resultado_Actual.Suma_Potencia /
+            Resultado_Actual.Lecturas_INA;
     }
 
-    printf("\n");
-    printf("==============================================================\n");
-    printf("                     COMPARACION FINAL                        \n");
-    printf("==============================================================\n");
+    // Calculo de energia acumulada
+    Resultado_Actual.Energia_Total = Energia_J;
+}
 
-    printf("\n%-36s %14s %14s\n", "Metrica", "Sin DMA", "Con DMA");
 
-    printf("%-36s %14.2f %14.2f\n", "Duracion efectiva (s)",
-           Resultados_Sin_DMA.Duracion_s, Resultados_Con_DMA.Duracion_s);
+/* 
+   7.18 COMPARACION FINAL
+   Este bloque presenta una comparacion entre los resultados
+   obtenidos mediante ADC One-shot y ADC Continuous con DMA.
+   Primero, se declaran Tiempo_Bloque_OneShot y Tiempo_Bloque_DMA
+   para almacenar el tiempo promedio de procesamiento por bloque
+   correspondiente a cada metodo de adquisicion.
+   Despues, las condiciones if comprueban que cada prueba
+   haya procesado al menos un bloque antes de calcular el
+   tiempo promedio correspondiente.
+   Para cada metodo, Tiempo_Procesamiento se divide entre
+   Bloques_Procesados y posteriormente entre 1000 para
+   convertir el resultado de microsegundos a milisegundos.
+   Finalmente, las instrucciones printf() presentan una
+   tabla que compara la duracion efectiva, los promedios
+   electricos, la energia, las muestras registradas,
+   el tiempo de procesamiento y los desbordamientos DMA.
+   Los valores de corriente y potencia se multiplican por
+   1000 para mostrarlos en miliamperios y milivatios.
+   En las metricas que no aplican al metodo One-shot se
+   muestra el texto correspondiente en lugar de un valor.
+    */
 
-    printf("%-36s %14.3f %14.3f\n", "Voltaje promedio (V)",
-           Resultados_Sin_DMA.Voltaje_Promedio, Resultados_Con_DMA.Voltaje_Promedio);
+void Mostrar_Comparacion(void)
+{
+    double Tiempo_Bloque_OneShot = 0;
+    double Tiempo_Bloque_DMA = 0;
 
-    printf("%-36s %14.3f %14.3f\n", "Corriente promedio (mA)",
-           Resultados_Sin_DMA.Corriente_Promedio, Resultados_Con_DMA.Corriente_Promedio);
+    // Calculo del tiempo promedio de procesamiento por bloque
+    if (Resultado_OneShot.Bloques_Procesados > 0)
+    {
+        Tiempo_Bloque_OneShot =
+            (double)Resultado_OneShot.Tiempo_Procesamiento /
+            Resultado_OneShot.Bloques_Procesados / 1000.0;
+    }
 
-    printf("%-36s %14.3f %14.3f\n", "Potencia promedio (mW)",
-           Resultados_Sin_DMA.Potencia_Promedio, Resultados_Con_DMA.Potencia_Promedio);
+    if (Resultado_DMA.Bloques_Procesados > 0)
+    {
+        Tiempo_Bloque_DMA =
+            (double)Resultado_DMA.Tiempo_Procesamiento /
+            Resultado_DMA.Bloques_Procesados / 1000.0;
+    }
 
-    printf("%-36s %14.6f %14.6f\n", "Energia acumulada (J)",
-           Resultados_Sin_DMA.Energia_J, Resultados_Con_DMA.Energia_J);
+    // Tabla comparativa de los resultados finales
+    printf("\n================ COMPARACION FINAL ================\n");
+    printf("Metrica                              |       One-Shot |            DMA\n");
+    printf("-------------------------------------+----------------+----------------\n");
 
-    printf("%-36s %14.0f %14.0f\n", "Muestras validas",
-           (double)Resultados_Sin_DMA.Muestras_ADC, (double)Resultados_Con_DMA.Muestras_ADC);
+    printf("Duracion efectiva (s)                | %14.3f | %14.3f\n",
+           Resultado_OneShot.Duracion_Efectiva,
+           Resultado_DMA.Duracion_Efectiva);
 
-    printf("%-36s %14.0f %14.0f\n", "Muestras perdidas",
-           (double)Resultados_Sin_DMA.Muestras_Perdidas, (double)Resultados_Con_DMA.Muestras_Perdidas);
+    printf("Voltaje promedio (V)                 | %14.3f | %14.3f\n",
+           Resultado_OneShot.Voltaje_Promedio,
+           Resultado_DMA.Voltaje_Promedio);
 
-    printf("%-36s %14.2f %14.2f\n", "Frecuencia efectiva (Hz)",
-           Resultados_Sin_DMA.Frecuencia_Real_Hz, Resultados_Con_DMA.Frecuencia_Real_Hz);
+    printf("Corriente promedio (mA)              | %14.3f | %14.3f\n",
+           Resultado_OneShot.Corriente_Promedio * 1000.0,
+           Resultado_DMA.Corriente_Promedio * 1000.0);
 
-    printf("%-36s %14.3f %14.3f\n", "Tiempo CPU por muestra (us)",
-           Resultados_Sin_DMA.Tiempo_Procesamiento_Promedio_us, Resultados_Con_DMA.Tiempo_Procesamiento_Promedio_us);
+    printf("Potencia promedio (mW)               | %14.3f | %14.3f\n",
+           Resultado_OneShot.Potencia_Promedio * 1000.0,
+           Resultado_DMA.Potencia_Promedio * 1000.0);
 
-    printf("%-36s %14s %14lu\n", "Desbordamientos DMA",
-           "N/A", (unsigned long)Resultados_Con_DMA.Desbordamientos);
+    printf("Energia acumulada (J)                | %14.4f | %14.4f\n",
+           Resultado_OneShot.Energia_Total,
+           Resultado_DMA.Energia_Total);
 
-    printf("\nReduccion de energia con DMA: %.2f %%\n", Reduccion_Energia);
+    printf("Muestras validas                     | %14" PRIu64 " | %14" PRIu64 "\n",
+           Resultado_OneShot.Muestras_Totales,
+           Resultado_DMA.Muestras_Totales);
 
-    printf("\n==============================================================\n");
-    printf("                    EVALUACION TERMINADA                      \n");
-    printf("==============================================================\n");
+    printf("Tiempo procesamiento por bloque (ms)| %14.6f | %14.6f\n",
+           Tiempo_Bloque_OneShot,
+           Tiempo_Bloque_DMA);
+
+    printf("Desbordamientos DMA                  | %14s | %14" PRIu32 "\n",
+           "No aplica",
+           Resultado_DMA.Desbordamientos);
 }
